@@ -12,7 +12,7 @@ name: playback-master
 
 on:
   schedule:
-    - cron: '07 23 * * *'   # offset from iOS/Android (22:53 UTC) to avoid collector contention
+    - cron: '53 22 * * *'   # aligned with iOS/Android nightly (collector contention is fine)
   workflow_dispatch:
     inputs:
       trackers:         { description: 'CSV: videojs,shaka,dash (empty = all)', required: false, default: '' }
