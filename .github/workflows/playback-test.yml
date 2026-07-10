@@ -1,0 +1,64 @@
+# Reusable: run one (tracker × version × leg) across a set of scenarios, headless,
+# and upload a SUMMARY.txt artifact. Trackers load from CDN at `version`, so there
+# is no build — just serve the rig page statically and drive it with Playwright.
+name: playback-test
+
+on:
+  workflow_call:
+    inputs:
+      tracker:       { required: true,  type: string }   # videojs | shaka | dash
+      version:       { required: true,  type: string }   # tracker package version (CDN)
+      leg:           { required: true,  type: string }   # chromium | firefox | webkit
+      scenarios_json:{ required: true,  type: string }   # JSON array of scenario ids
+      run_id:        { required: true,  type: string }
+      mt_url:        { required: false, type: string, default: '' }  # ad-ssai only (paid)
+    secrets:
+      NEW_RELIC_LICENSE_KEY: { required: true }
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+
+      - name: Install harness + Playwright browser (${{ inputs.leg }})
+        working-directory: harness
+        run: |
+          npm install
+          npx playwright install --with-deps ${{ inputs.leg }}
+
+      - name: Serve rig statically (no live-reload)
+        run: |
+          python3 -m http.server 8899 --bind 127.0.0.1 &
+          for i in $(seq 1 20); do curl -sf -o /dev/null http://127.0.0.1:8899/samples/rig/index.html && break; sleep 0.5; done
+
+      - name: Run scenarios
+        env:
+          BASE_URL: http://127.0.0.1:8899
+          PLAYER:   ${{ inputs.tracker }}
+          TVER:     ${{ inputs.version }}
+          LEG:      ${{ inputs.leg }}
+          RUN_ID:   ${{ inputs.run_id }}
+          MT_URL:   ${{ inputs.mt_url }}
+          NEW_RELIC_LICENSE_KEY: ${{ secrets.NEW_RELIC_LICENSE_KEY }}
+        run: |
+          set -uo pipefail
+          : > SUMMARY.txt
+          for scen in $(echo '${{ inputs.scenarios_json }}' | jq -r '.[]'); do
+            echo "▶ ${{ inputs.tracker }} / $scen / v${{ inputs.version }} / ${{ inputs.leg }}"
+            SCENARIO="$scen" OUT="$PWD/SUMMARY.txt" node harness/run.mjs || echo "run.mjs non-zero for $scen"
+          done
+          echo "── SUMMARY ──"; cat SUMMARY.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: playback-${{ inputs.tracker }}-${{ inputs.version }}-${{ inputs.leg }}-${{ inputs.run_id }}
+          path: SUMMARY.txt
+          if-no-files-found: warn

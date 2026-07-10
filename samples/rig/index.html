@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>NRVA multi-player rig</title>
+  <!--
+    Unified playback rig for the telemetry-generator CI. Drives ONE of the three
+    NR video trackers (videojs / shaka / dash) against a real player + real stream,
+    wires New Relic, and exposes window.__rig = { viewId, events, status } for the
+    headless harness. Everything comes from CDN so no build step is needed; the
+    tracker UMD is pulled at the requested version so the version-variation matrix
+    is just a query param.
+
+    Query params:
+      player         = videojs | shaka | dash        (required)
+      scenario       = content-hls | content-dash | ad-ima | ad-ssai | error
+      trackerVersion = e.g. 4.2.1                     (CDN version of the tracker pkg)
+      mtUrl          = MediaTailor playback URL       (ad-ssai only; paid/gated)
+      key            = NR license/ingest key          (from CI env; never hardcoded)
+      runId, leg     = correlation tags
+  -->
+  <link href="https://cdn.jsdelivr.net/npm/video.js@8.23.9/dist/video-js.css" rel="stylesheet" />
+  <style>html,body{margin:0;background:#000}#v{width:100%;max-width:960px}</style>
+</head>
+<body>
+  <video id="v" class="video-js" controls muted playsinline width="960" height="540"></video>
+  <script>
+  // ── NR endpoint constants: base64-encoded, decoded at init (never plaintext) ──
+  const NR_BEACON_B64 = 'c3RhZ2luZy1iYW0tY2VsbC5uci1kYXRhLm5ldA==';   // staging-bam-cell.nr-data.net
+  const NR_APPID_B64  = 'MzMzMDUzOTE3';                               // 333053917
+
+  const q = new URLSearchParams(location.search);
+  const PLAYER   = q.get('player')   || 'videojs';
+  const SCENARIO = q.get('scenario') || 'content-hls';
+  const TVER     = q.get('trackerVersion') || 'latest';
+  const MT_URL   = q.get('mtUrl') || '';
+  const KEY      = q.get('key') || '';           // supplied by the harness from env
+  const RUN_ID   = q.get('runId') || 'local';
+  const LEG      = q.get('leg') || 'local';
+
+  window.__rig = { player: PLAYER, scenario: SCENARIO, status: 'init', viewId: null, events: [] };
+
+  // Real streams + ad tags, picked from each tracker repo's own samples.
+  const STREAMS = {
+    videojs: {
+      'content-hls': ['https://d2ne8z1csjj3og.cloudfront.net/demos/media/adam/hls/adamdemo.m3u8', 'application/x-mpegURL'],
+      'ad-ssai':     [MT_URL, 'application/x-mpegURL'],
+    },
+    shaka: {
+      'content-hls':  ['https://demo.unified-streaming.com/k8s/features/stable/video/tears-of-steel/tears-of-steel.ism/.m3u8'],
+      'content-dash': ['https://turtle-tube.appspot.com/t/t2/dash.mpd'],
+    },
+    dash: {
+      'content-dash': ['https://dash.akamaized.net/akamai/bbb_30fps/bbb_30fps.mpd'],
+    },
+  };
+  const IMA_VMAP = 'https://pubads.g.doubleclick.net/gampad/ads?iu=/21775744923/external/vmap_ad_samples&sz=640x480&cust_params=sample_ar%3Dpremidpost&ciu_szs=300x250&gdfp_req=1&ad_rule=1&output=vmap&unviewed_position_start=1&env=vp&impl=s&cmsid=496&vid=short_onecue&correlator=';
+
+  const TRACKER_UMD = {
+    videojs: `https://cdn.jsdelivr.net/npm/@newrelic/video-videojs@${TVER}/dist/umd/newrelic-video-videojs.min.js`,
+    shaka:   `https://cdn.jsdelivr.net/npm/@newrelic/video-shaka@${TVER}/dist/umd/newrelic-video-shaka.min.js`,
+    dash:    `https://cdn.jsdelivr.net/npm/@newrelic/video-dash@${TVER}/dist/umd/newrelic-video-dash.min.js`,
+  };
+
+  const nrOptions = () => ({
+    info: { beacon: atob(NR_BEACON_B64), applicationID: atob(NR_APPID_B64), licenseKey: KEY },
+    // Correlation tags — merged into every event by the core tracker's customData.
+    customData: { runId: RUN_ID, trackerType: PLAYER, scenarioId: SCENARIO, leg: LEG, trackerVersion: TVER },
+  });
+
+  // ── Harvest interceptor: capture the actual sent events (== NR payload) so the
+  //    harness reads viewId + AD/CONTENT actionNames as ground truth, cross-tracker.
+  function installHarvestTap() {
+    const record = (raw) => {
+      if (!raw) return;
+      let text = typeof raw === 'string' ? raw : '';
+      try { if (raw instanceof Blob) return; } catch (e) {}
+      if (!text || !/viewId|actionName|VideoAction/.test(text)) return;
+      // NR payloads are JSON-ish; pull the fields we care about with tolerant regex.
+      const vids = text.match(/"viewId":"([^"]+)"/g) || [];
+      if (vids.length && !window.__rig.viewId) window.__rig.viewId = vids[0].split('"')[3];
+      const acts = text.match(/"actionName":"([^"]+)"/g) || [];
+      for (const a of acts) window.__rig.events.push({ actionName: a.split('"')[3] });
+    };
+    const of = window.fetch;
+    window.fetch = function (i, init) { try { record(init && init.body); } catch (e) {} return of.apply(this, arguments); };
+    const os = navigator.sendBeacon && navigator.sendBeacon.bind(navigator);
+    if (os) navigator.sendBeacon = function (u, data) { try { record(typeof data === 'string' ? data : '') ; } catch (e) {} return os(u, data); };
+  }
+
+  const load = (src) => new Promise((res, rej) => {
+    const s = document.createElement('script'); s.src = src; s.onload = res; s.onerror = () => rej(new Error('load fail: ' + src));
+    document.head.appendChild(s);
+  });
+
+  async function initVideojs() {
+    await load('https://cdn.jsdelivr.net/npm/video.js@8.23.9/dist/video.min.js');
+    await load(TRACKER_UMD.videojs);
+    const player = videojs('v', { autoplay: true, muted: true, html5: { vhs: { overrideNative: true } } });
+    /* global VideojsTracker */
+    const opts = nrOptions();
+    if (SCENARIO === 'ad-ssai') opts.mediatailor = true;
+    new VideojsTracker(player, opts);
+    if (SCENARIO === 'ad-ima') {
+      await load('https://imasdk.googleapis.com/js/sdkloader/ima3.js');
+      await load('https://cdn.jsdelivr.net/npm/videojs-contrib-ads@6.9.0/dist/videojs.ads.min.js');
+      await load('https://cdn.jsdelivr.net/npm/videojs-ima@1.11.0/dist/videojs.ima.min.js');
+      player.src({ src: STREAMS.videojs['content-hls'][0], type: 'application/x-mpegURL' });
+      player.ima && player.ima({ adTagUrl: IMA_VMAP });
+    } else {
+      const [src, type] = STREAMS.videojs[SCENARIO] || STREAMS.videojs['content-hls'];
+      player.src({ src, type });
+    }
+    player.play().catch(() => {});
+  }
+
+  async function initShaka() {
+    await load('https://cdn.jsdelivr.net/npm/shaka-player@5.0.4/dist/shaka-player.compiled.min.js');
+    await load(TRACKER_UMD.shaka);
+    const video = document.getElementById('v');
+    /* global shaka, ShakaTracker */
+    const player = new shaka.Player();
+    await player.attach(video);
+    new ShakaTracker(player, nrOptions());
+    const [src] = STREAMS.shaka[SCENARIO] || STREAMS.shaka['content-hls'];
+    await player.load(src);
+    video.play().catch(() => {});
+  }
+
+  async function initDash() {
+    await load('https://cdnjs.cloudflare.com/ajax/libs/dashjs/4.7.4/dash.all.min.js');
+    await load(TRACKER_UMD.dash);
+    const video = document.getElementById('v');
+    /* global dashjs, DashTracker */
+    const player = dashjs.MediaPlayer().create();
+    new DashTracker(player, nrOptions());
+    const [src] = STREAMS.dash[SCENARIO] || STREAMS.dash['content-dash'];
+    player.initialize(video, src, true);
+  }
+
+  (async () => {
+    installHarvestTap();
+    try {
+      if (SCENARIO === 'error') {                       // deliberate bad source → error path
+        if (PLAYER === 'videojs') { await load('https://cdn.jsdelivr.net/npm/video.js@8.23.9/dist/video.min.js'); await load(TRACKER_UMD.videojs); const p = videojs('v', { autoplay: true, muted: true }); new VideojsTracker(p, nrOptions()); p.src({ src: 'https://example.com/does-not-exist.m3u8', type: 'application/x-mpegURL' }); p.play().catch(() => {}); }
+      } else if (PLAYER === 'videojs') { await initVideojs(); }
+      else if (PLAYER === 'shaka')   { await initShaka(); }
+      else if (PLAYER === 'dash')    { await initDash(); }
+      window.__rig.status = 'playing';
+    } catch (e) {
+      window.__rig.status = 'error'; window.__rig.error = String(e && e.message || e);
+    }
+  })();
+  </script>
+</body>
+</html>

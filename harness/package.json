@@ -1,0 +1,9 @@
+{
+  "name": "nrva-playback-harness",
+  "private": true,
+  "type": "module",
+  "description": "Headless multi-player playback harness for the telemetry-generator CI.",
+  "dependencies": {
+    "playwright": "^1.47.0"
+  }
+}

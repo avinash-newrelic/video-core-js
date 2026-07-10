@@ -1,0 +1,16 @@
+{
+  "_comment": "Defaults for the multi-tracker playback telemetry generator. Trackers load from CDN by version, so there is no build step. ad-ssai is videojs-only and paid — gated behind mt_url (see playback-master.yml).",
+  "min_version": "4.1.0",
+  "legs": ["chromium", "firefox", "webkit"],
+  "trackers": [
+    { "type": "videojs", "pkg": "@newrelic/video-videojs", "repo": "newrelic/video-videojs-js", "ssai": true },
+    { "type": "shaka",   "pkg": "@newrelic/video-shaka",   "repo": "newrelic/video-shaka-js",   "ssai": false },
+    { "type": "dash",    "pkg": "@newrelic/video-dash",    "repo": "newrelic/video-dash-js",    "ssai": false }
+  ],
+  "scenarios": {
+    "videojs": ["content-hls", "error"],
+    "shaka":   ["content-hls", "content-dash"],
+    "dash":    ["content-dash"]
+  },
+  "ssai_scenarios": ["ad-ssai"]
+}

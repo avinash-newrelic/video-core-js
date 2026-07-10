@@ -1,0 +1,140 @@
+# Multi-tracker playback telemetry generator (videojs / shaka / dash on video-core).
+#
+# discover → test → summary. Trackers load from CDN by version (no build step).
+# Generator, not a pass/fail gate — events land in the NR staging account, keyed
+# by runId + viewId. Mirrors the Android/iOS playback-master workflows.
+#
+# COST GATE: the `ad-ssai` scenario hits AWS MediaTailor, which is PAID. It is
+# videojs-only and NEVER runs on schedule — it runs only when a non-empty `mt_url`
+# is supplied via workflow_dispatch (or repo var MT_PLAYBACK_URL is set).
+
+name: playback-master
+
+on:
+  schedule:
+    - cron: '07 23 * * *'   # offset from iOS/Android (22:53 UTC) to avoid collector contention
+  workflow_dispatch:
+    inputs:
+      trackers:         { description: 'CSV: videojs,shaka,dash (empty = all)', required: false, default: '' }
+      tracker_versions: { description: 'CSV of tracker versions (empty = latest release each)', required: false, default: '' }
+      legs:             { description: 'CSV: chromium,firefox,webkit (empty = all)', required: false, default: '' }
+      scenarios:        { description: 'CSV scenario ids override (empty = defaults per tracker)', required: false, default: '' }
+      min_version:      { description: 'Version floor (empty = defaults file)', required: false, default: '' }
+      mt_url:           { description: 'MediaTailor playback URL — PAID opt-in gate for ad-ssai (videojs only). Empty = ad-ssai skipped.', required: false, default: '' }
+
+concurrency:
+  group: playback-master
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      run_id: ${{ steps.plan.outputs.run_id }}
+      mt_open: ${{ steps.plan.outputs.mt_open }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IN_TRACKERS: ${{ inputs.trackers }}
+          IN_VERSIONS: ${{ inputs.tracker_versions }}
+          IN_LEGS: ${{ inputs.legs }}
+          IN_SCEN: ${{ inputs.scenarios }}
+          IN_MIN: ${{ inputs.min_version }}
+          IN_MT_URL: ${{ inputs.mt_url }}
+          VAR_MT_URL: ${{ vars.MT_PLAYBACK_URL }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          D='.github/workflows/playback-defaults.json'
+
+          # --- MediaTailor cost gate: ad-ssai only on manual dispatch WITH an mt_url
+          #     (or repo var), NEVER on schedule. This is the paid opt-in.
+          MT_URL=""
+          if [ "$EVENT" = "workflow_dispatch" ] && [ -n "${IN_MT_URL// /}" ]; then MT_URL="$IN_MT_URL";
+          elif [ "$EVENT" = "workflow_dispatch" ] && [ -n "${VAR_MT_URL// /}" ]; then MT_URL="$VAR_MT_URL"; fi
+          if [ -n "$MT_URL" ]; then MT_OPEN=true; else MT_OPEN=false; echo "ad-ssai: skipped (no MT URL — paid, opt-in only)"; fi
+          echo "mt_open=$MT_OPEN" >> "$GITHUB_OUTPUT"
+
+          TRACKERS=$(jq -c '.trackers' "$D")
+          [ -n "${IN_TRACKERS// /}" ] && TRACKERS=$(echo "$TRACKERS" | jq -c --arg t "$IN_TRACKERS" '[ .[] | select(.type as $x | ($t|split(",")|map(gsub("^ +| +$";""))) | index($x)) ]')
+          LEGS=$(jq -c '.legs' "$D"); [ -n "${IN_LEGS// /}" ] && LEGS=$(echo "$IN_LEGS" | tr ',' '\n' | sed 's/ //g' | grep -v '^$' | jq -R . | jq -sc .)
+
+          # Build matrix entries: one per tracker × version × leg, carrying that
+          # tracker's scenarios (+ ad-ssai iff videojs and the gate is open).
+          ENTRIES='[]'
+          for row in $(echo "$TRACKERS" | jq -rc '.[]'); do
+            type=$(echo "$row" | jq -r .type); repo=$(echo "$row" | jq -r .repo); ssai=$(echo "$row" | jq -r .ssai)
+            # versions: input override else latest release of this tracker's repo
+            if [ -n "${IN_VERSIONS// /}" ]; then
+              VERS=$(echo "$IN_VERSIONS" | tr ',' '\n' | sed 's/ //g' | grep -v '^$' | jq -R . | jq -sc .)
+            else
+              latest=$(gh release list --repo "$repo" --limit 1 --json tagName --jq '.[0].tagName' | sed 's/^v//')
+              VERS=$(jq -nc --arg v "$latest" '[$v]')
+            fi
+            # scenarios for this tracker
+            if [ -n "${IN_SCEN// /}" ]; then
+              SCEN=$(echo "$IN_SCEN" | tr ',' '\n' | sed 's/ //g' | grep -v '^$' | jq -R . | jq -sc .)
+            else
+              SCEN=$(jq -c --arg t "$type" '.scenarios[$t] // []' "$D")
+              if [ "$type" = "videojs" ] && [ "$MT_OPEN" = "true" ]; then SCEN=$(echo "$SCEN" | jq -c --argjson add "$(jq -c '.ssai_scenarios' "$D")" '. + $add'); fi
+            fi
+            MTV=""; if [ "$type" = "videojs" ] && [ "$MT_OPEN" = "true" ]; then MTV="$MT_URL"; fi
+            ENTRIES=$(echo "$ENTRIES" | jq -c \
+              --arg type "$type" --argjson vers "$VERS" --argjson legs "$LEGS" --argjson scen "$SCEN" --arg mt "$MTV" \
+              '. + [ $vers[] as $v | $legs[] as $l | { tracker:$type, version:$v, leg:$l, scenarios_json:($scen|tostring), mt_url:$mt } ]')
+          done
+
+          echo "matrix=$(jq -nc --argjson e "$ENTRIES" '{include:$e}')" >> "$GITHUB_OUTPUT"
+          echo "run_id=${{ github.run_id }}" >> "$GITHUB_OUTPUT"
+          { echo "### Plan"; echo "- MT gate open: $MT_OPEN"; echo '```json'; echo "$ENTRIES" | jq .; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+  test:
+    needs: discover
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix: ${{ fromJson(needs.discover.outputs.matrix) }}
+    uses: ./.github/workflows/playback-test.yml
+    with:
+      tracker: ${{ matrix.tracker }}
+      version: ${{ matrix.version }}
+      leg: ${{ matrix.leg }}
+      scenarios_json: ${{ matrix.scenarios_json }}
+      run_id: ${{ needs.discover.outputs.run_id }}
+      mt_url: ${{ matrix.mt_url }}
+    secrets:
+      NEW_RELIC_LICENSE_KEY: ${{ secrets.NEW_RELIC_LICENSE_KEY }}
+
+  summary:
+    needs: [discover, test]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { pattern: 'playback-*', path: artifacts }
+        continue-on-error: true
+      - name: Render summary + viewIds
+        env: { RUN_ID: ${{ needs.discover.outputs.run_id }} }
+        run: |
+          {
+            echo "# 🎬 Playback telemetry — run ${RUN_ID}"
+            echo ""
+            echo "Generator (no pass/fail gate). Find in NR: \`SELECT count(*) FROM VideoAction, VideoAdAction WHERE runId='${RUN_ID}' FACET trackerType, trackerVersion, leg, actionName SINCE 1 day ago\`"
+            echo ""
+            echo "| tracker | version | leg | scenario | result | viewId |"
+            echo "|---|---|---|---|---|---|"
+            find artifacts -name SUMMARY.txt | while read -r f; do
+              while IFS=$'\t' read -r pl sc st el vid; do
+                [ -z "$pl" ] && continue
+                icon="✅"; [ "$st" != "ok" ] && icon="⚠️"
+                echo "| $pl |  | | $sc | $icon $st ($el) | \`$vid\` |"
+              done < "$f"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
