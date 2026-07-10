@@ -9,7 +9,7 @@ on:
       tracker:       { required: true,  type: string }   # videojs | shaka | dash
       version:       { required: true,  type: string }   # tracker package version (CDN)
       leg:           { required: true,  type: string }   # chromium | firefox | webkit
-      scenarios_json:{ required: true,  type: string }   # JSON array of scenario ids
+      scenarios_json: { required: true, type: string }   # JSON array of scenario ids
       run_id:        { required: true,  type: string }
       mt_url:        { required: false, type: string, default: '' }  # ad-ssai only (paid)
     secrets:
