@@ -127,18 +127,56 @@ jobs:
         env:
           RUN_ID: ${{ needs.discover.outputs.run_id }}
         run: |
-          {
-            echo "# 🎬 Playback telemetry — run ${RUN_ID}"
-            echo ""
-            echo "Generator (no pass/fail gate). Find in NR: \`SELECT count(*) FROM VideoAction, VideoAdAction WHERE runId='${RUN_ID}' FACET trackerType, trackerVersion, leg, actionName SINCE 1 day ago\`"
-            echo ""
-            echo "| tracker | version | leg | scenario | result | viewId |"
-            echo "|---|---|---|---|---|---|"
-            find artifacts -name SUMMARY.txt | while read -r f; do
-              while IFS=$'\t' read -r pl sc st el vid; do
-                [ -z "$pl" ] && continue
-                icon="✅"; [ "$st" != "ok" ] && icon="⚠️"
-                echo "| $pl |  | | $sc | $icon $st ($el) | \`$vid\` |"
-              done < "$f"
-            done
-          } >> "$GITHUB_STEP_SUMMARY"
+          python3 - <<'PY'
+          import os, glob, collections
+          RUN = os.environ["RUN_ID"]
+          grid = collections.defaultdict(dict)   # (tracker,version) -> leg -> (ok,total)
+          views = collections.defaultdict(list)  # (tracker,version,leg) -> [(scenario,viewId,status)]
+          legs = []
+          for d in sorted(glob.glob("artifacts/playback-*")):
+              # artifact name: playback-<tracker>-<version>-<leg>-<run_id>
+              p = os.path.basename(d).split("-")
+              if len(p) < 5:
+                  continue
+              tracker, version, leg = p[1], p[2], p[3]
+              if leg not in legs:
+                  legs.append(leg)
+              f = os.path.join(d, "SUMMARY.txt")
+              ok = tot = 0
+              if os.path.exists(f):
+                  for line in open(f):
+                      c = line.rstrip("\n").split("\t")
+                      if len(c) < 5:
+                          continue
+                      _pl, sc, st, _el, vid = c[:5]
+                      tot += 1; ok += (st == "ok")
+                      views[(tracker, version, leg)].append((sc, vid, st))
+              grid[(tracker, version)][leg] = (ok, tot)
+          legs = sorted(set(legs))
+
+          o = [f"# 🎬 Playback telemetry — run {RUN}", "",
+               "Generator (no pass/fail gate). Each cell = scenarios `ok/total` (✅ all · ⚠️ partial · ❌ none · ❔ missing).", ""]
+          o.append("| tracker · version | " + " | ".join(legs) + " |")
+          o.append("|---|" + "|".join(["---"] * len(legs)) + "|")
+          tok = tall = 0
+          for (tracker, version) in sorted(grid):
+              cells = []
+              for leg in legs:
+                  ok, tot = grid[(tracker, version)].get(leg, (0, 0))
+                  tok += ok; tall += tot
+                  cells.append("❔ —" if tot == 0 else f"✅ {ok}/{tot}" if ok == tot else f"⚠️ {ok}/{tot}" if ok else f"❌ {ok}/{tot}")
+              o.append(f"| `{tracker}` · {version} | " + " | ".join(cells) + " |")
+          o += ["", f"**Aggregate:** {tok}/{tall} scenario runs produced telemetry across the matrix.", "",
+                "## Sessions (viewIds)", "", "Click a (tracker · version · leg) to see its scenario → viewId mapping.", ""]
+          for k in sorted(views):
+              tracker, version, leg = k
+              o += ["<details>", f"<summary><code>{tracker} v{version}</code> · {leg}</summary>", "",
+                    "| scenario | viewId | result |", "|---|---|---|"]
+              o += [f"| {sc} | `{vid}` | {st} |" for sc, vid, st in views[k]]
+              o += ["", "</details>", ""]
+          o += ["### Find in New Relic", "```sql",
+                f"SELECT count(*) FROM VideoAction, VideoAdAction WHERE runId='{RUN}' FACET trackerType, trackerVersion, leg, actionName SINCE 1 day ago",
+                "```"]
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as fh:
+              fh.write("\n".join(o) + "\n")
+          PY
