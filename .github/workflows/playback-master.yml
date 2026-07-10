@@ -71,12 +71,15 @@ jobs:
           ENTRIES='[]'
           for row in $(echo "$TRACKERS" | jq -rc '.[]'); do
             type=$(echo "$row" | jq -r .type); repo=$(echo "$row" | jq -r .repo); ssai=$(echo "$row" | jq -r .ssai)
-            # versions: input override else latest release of this tracker's repo
+            # versions: input override, else FULL sweep of every release >= min_version
+            # for this tracker (so both nightly and a no-input dispatch run the full matrix).
+            MIN="${IN_MIN:-$(jq -r '.min_version' "$D")}"
             if [ -n "${IN_VERSIONS// /}" ]; then
               VERS=$(echo "$IN_VERSIONS" | tr ',' '\n' | sed 's/ //g' | grep -v '^$' | jq -R . | jq -sc .)
             else
-              latest=$(gh release list --repo "$repo" --limit 1 --json tagName --jq '.[0].tagName' | sed 's/^v//')
-              VERS=$(jq -nc --arg v "$latest" '[$v]')
+              VERS=$(gh release list --repo "$repo" --limit 100 --json tagName --jq '[.[].tagName | sub("^v";"")]' \
+                | jq -c 'map(select(test("^[0-9]+\\.[0-9]+\\.[0-9]+$")))' \
+                | jq -c --arg min "$MIN" 'map(select((split(".")|map(tonumber)) as $v | ($min|split(".")|map(tonumber)) as $m | $v[0]>$m[0] or ($v[0]==$m[0] and ($v[1]>$m[1] or ($v[1]==$m[1] and $v[2]>=$m[2]))) ))')
             fi
             # scenarios for this tracker
             if [ -n "${IN_SCEN// /}" ]; then
