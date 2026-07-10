@@ -8,9 +8,9 @@
     { "type": "dash",    "pkg": "@newrelic/video-dash",    "repo": "newrelic/video-dash-js",    "ssai": false }
   ],
   "scenarios": {
-    "videojs": ["content-hls", "error"],
-    "shaka":   ["content-hls", "content-dash"],
-    "dash":    ["content-dash"]
+    "videojs": ["content-hls", "content-hls-lifecycle", "ad-ima", "error"],
+    "shaka":   ["content-hls", "content-dash", "content-hls-lifecycle"],
+    "dash":    ["content-dash", "content-dash-lifecycle"]
   },
   "ssai_scenarios": ["ad-ssai"]
 }

@@ -20,7 +20,8 @@ const LEG = E.LEG || 'chromium';
 const RUN_ID = E.RUN_ID || 'local';
 const OUT = E.OUT || 'SUMMARY.txt';
 const isAd = SCEN.startsWith('ad');
-const DUR = parseInt(E.DURATION_MS || (isAd ? '230000' : '75000'), 10); // ads need ≥1 full break
+const isLifecycle = SCEN.includes('lifecycle');   // must run the full scripted pause/resume/seek
+const DUR = parseInt(E.DURATION_MS || (isAd ? '230000' : isLifecycle ? '50000' : '75000'), 10);
 
 const params = new URLSearchParams({
   player: PLAYER, scenario: SCEN, trackerVersion: TVER, runId: RUN_ID, leg: LEG,
@@ -47,8 +48,9 @@ try {
       status: window.__rig?.status, viewId: window.__rig?.viewId, error: window.__rig?.error || null,
       acts: [...new Set((window.__rig?.events || []).map((e) => e.actionName))],
     }));
-    // content: stop once we have a viewId + a START event. ads: run the full window to capture the break.
-    if (!isAd && rig.viewId && rig.acts.some((a) => /START/.test(a))) break;
+    // plain content: stop once we have a viewId + START. ads + lifecycle: run the
+    // full window (to capture the break / the scripted pause-resume-seek).
+    if (!isAd && !isLifecycle && rig.viewId && rig.acts.some((a) => /START/.test(a))) break;
     await page.waitForTimeout(3000);
   }
 } catch (e) {
