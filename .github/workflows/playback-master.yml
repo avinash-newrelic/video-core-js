@@ -124,7 +124,8 @@ jobs:
         with: { pattern: 'playback-*', path: artifacts }
         continue-on-error: true
       - name: Render summary + viewIds
-        env: { RUN_ID: ${{ needs.discover.outputs.run_id }} }
+        env:
+          RUN_ID: ${{ needs.discover.outputs.run_id }}
         run: |
           {
             echo "# 🎬 Playback telemetry — run ${RUN_ID}"
